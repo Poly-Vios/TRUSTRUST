@@ -1,4 +1,4 @@
-## **crate**
+## **Crate**
 A package of Rust code.  
 Binary crates → executables.  
 Library crates → reusable code.
