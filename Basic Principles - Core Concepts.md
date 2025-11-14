@@ -1,4 +1,4 @@
-# **Variable**
+## **Variable**
 A named container that stores a value in memory.  
 Example: `let x = 5;`
 
