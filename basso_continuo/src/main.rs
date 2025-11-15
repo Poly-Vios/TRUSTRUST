@@ -24,6 +24,21 @@ impl Pitch {
         let note = names[(self.midi_number % 12) as usize];
         format!("{}{}", note, octave)
     }
+    
+    fn from_bass_and_interval(bass: Pitch, interval: i8, key: &Key) -> Self {
+        let bass_pc = bass.midi_number % 12;
+        let scale_degree = key.pitch_class_to_scale_degree(bass_pc);
+        let target_degree = ((scale_degree as i8 + interval - 1) % 7) as usize;
+        let target_pc = key.scale[target_degree];
+        
+        // Find the closest target_pc above or at bass
+        let mut midi = bass.midi_number;
+        while midi % 12 != target_pc {
+            midi += 1;
+        }
+        
+        Pitch::new(midi)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -42,10 +57,237 @@ impl fmt::Display for Voicing {
     }
 }
 
-#[derive(Debug)]
+// ============================================================================
+// KEY AND SCALE
+// ============================================================================
+
+#[derive(Debug, Clone)]
+struct Key {
+    tonic: u8, // pitch class 0-11
+    mode: Mode,
+    scale: Vec<u8>, // pitch classes of the scale degrees
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Mode {
+    Major,
+    Minor, // Natural minor
+}
+
+impl Key {
+    fn new(tonic: u8, mode: Mode) -> Self {
+        let scale = match mode {
+            Mode::Major => vec![
+                tonic,
+                (tonic + 2) % 12,
+                (tonic + 4) % 12,
+                (tonic + 5) % 12,
+                (tonic + 7) % 12,
+                (tonic + 9) % 12,
+                (tonic + 11) % 12,
+            ],
+            Mode::Minor => vec![
+                tonic,
+                (tonic + 2) % 12,
+                (tonic + 3) % 12,
+                (tonic + 5) % 12,
+                (tonic + 7) % 12,
+                (tonic + 8) % 12,
+                (tonic + 10) % 12,
+            ],
+        };
+        
+        Self { tonic, mode, scale }
+    }
+    
+    fn c_major() -> Self {
+        Self::new(0, Mode::Major)
+    }
+    
+    fn pitch_class_to_scale_degree(&self, pc: u8) -> usize {
+        self.scale.iter().position(|&x| x == pc).unwrap_or(0)
+    }
+}
+
+// ============================================================================
+// FIGURED BASS STRUCTURES
+// ============================================================================
+
+#[derive(Debug, Clone)]
+struct Figure {
+    intervals: Vec<Interval>,
+}
+
+#[derive(Debug, Clone)]
+struct Interval {
+    number: u8, // 3, 5, 6, 7, etc.
+    accidental: Accidental,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Accidental {
+    Natural,
+    Sharp,
+    Flat,
+    None, // Use the key signature
+}
+
+impl Figure {
+    // Parse figured bass notation
+    fn parse(notation: &str) -> Self {
+        let notation = notation.trim();
+        
+        // Empty or whitespace = root position triad (5/3)
+        if notation.is_empty() {
+            return Figure {
+                intervals: vec![
+                    Interval { number: 3, accidental: Accidental::None },
+                    Interval { number: 5, accidental: Accidental::None },
+                ],
+            };
+        }
+        
+        // Common shorthand patterns
+        match notation {
+            "6" => return Figure {
+                intervals: vec![
+                    Interval { number: 3, accidental: Accidental::None },
+                    Interval { number: 6, accidental: Accidental::None },
+                ],
+            },
+            "6/4" | "64" => return Figure {
+                intervals: vec![
+                    Interval { number: 4, accidental: Accidental::None },
+                    Interval { number: 6, accidental: Accidental::None },
+                ],
+            },
+            "7" => return Figure {
+                intervals: vec![
+                    Interval { number: 3, accidental: Accidental::None },
+                    Interval { number: 5, accidental: Accidental::None },
+                    Interval { number: 7, accidental: Accidental::None },
+                ],
+            },
+            "6/5" | "65" => return Figure {
+                intervals: vec![
+                    Interval { number: 3, accidental: Accidental::None },
+                    Interval { number: 5, accidental: Accidental::None },
+                    Interval { number: 6, accidental: Accidental::None },
+                ],
+            },
+            "4/3" | "43" => return Figure {
+                intervals: vec![
+                    Interval { number: 3, accidental: Accidental::None },
+                    Interval { number: 4, accidental: Accidental::None },
+                    Interval { number: 6, accidental: Accidental::None },
+                ],
+            },
+            "4/2" | "42" | "2" => return Figure {
+                intervals: vec![
+                    Interval { number: 2, accidental: Accidental::None },
+                    Interval { number: 4, accidental: Accidental::None },
+                    Interval { number: 6, accidental: Accidental::None },
+                ],
+            },
+            "#" => return Figure {
+                intervals: vec![
+                    Interval { number: 3, accidental: Accidental::Sharp },
+                    Interval { number: 5, accidental: Accidental::None },
+                ],
+            },
+            _ => {}
+        }
+        
+        // Parse more complex notation (simplified parser)
+        let mut intervals = Vec::new();
+        let parts: Vec<&str> = notation.split('/').collect();
+        
+        for part in parts {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            
+            let (accidental, num_str) = if part.starts_with('#') {
+                (Accidental::Sharp, &part[1..])
+            } else if part.starts_with('b') {
+                (Accidental::Flat, &part[1..])
+            } else if part.starts_with('♮') {
+                (Accidental::Natural, &part[3..]) // ♮ is 3 bytes in UTF-8
+            } else {
+                (Accidental::None, part)
+            };
+            
+            if let Ok(number) = num_str.parse::<u8>() {
+                intervals.push(Interval { number, accidental });
+            }
+        }
+        
+        Figure { intervals }
+    }
+    
+    // Convert figured bass to actual chord tones
+    fn realize(&self, bass: Pitch, key: &Key) -> Vec<Pitch> {
+        let mut tones = vec![bass]; // Bass is always included
+        
+        for interval in &self.intervals {
+            let semitones = self.interval_to_semitones(bass, interval, key);
+            let pitch = Pitch::new(bass.midi_number + semitones as u8);
+            tones.push(pitch);
+        }
+        
+        tones.sort();
+        tones.dedup_by_key(|p| p.midi_number % 12);
+        tones
+    }
+    
+    fn interval_to_semitones(&self, bass: Pitch, interval: &Interval, key: &Key) -> i8 {
+        let bass_pc = bass.midi_number % 12;
+        let bass_degree = key.pitch_class_to_scale_degree(bass_pc);
+        
+        // Calculate target scale degree
+        let target_degree = (bass_degree + interval.number as usize - 1) % 7;
+        let target_pc = key.scale[target_degree];
+        
+        // Calculate semitone distance
+        let mut semitones = if target_pc >= bass_pc {
+            target_pc - bass_pc
+        } else {
+            12 + target_pc - bass_pc
+        };
+        
+        // Apply accidentals
+        match interval.accidental {
+            Accidental::Sharp => semitones += 1,
+            Accidental::Flat => semitones = semitones.saturating_sub(1),
+            Accidental::Natural => {
+                // Force natural (cancel key signature) - simplified
+            }
+            Accidental::None => {}
+        }
+        
+        semitones as i8
+    }
+}
+
+#[derive(Debug, Clone)]
 struct FiguredBassSymbol {
     bass: Pitch,
-    chord_tones: Vec<Pitch>, // Already calculated from figures
+    figure: Figure,
+    chord_tones: Vec<Pitch>,
+}
+
+impl FiguredBassSymbol {
+    fn new(bass: Pitch, figure_notation: &str, key: &Key) -> Self {
+        let figure = Figure::parse(figure_notation);
+        let chord_tones = figure.realize(bass, key);
+        
+        Self {
+            bass,
+            figure,
+            chord_tones,
+        }
+    }
 }
 
 // Voice ranges in MIDI numbers
@@ -310,50 +552,41 @@ fn realize_figured_bass(symbols: &[FiguredBassSymbol]) -> Vec<Voicing> {
 // ============================================================================
 
 fn main() {
-    // Example: Simple progression in C major
-    // C major -> F major (first inversion, bass on A) -> G major -> C major
+    let key = Key::c_major();
     
+    // Example: I - IV6 - V - I progression in C major
+    // Using figured bass notation!
     let progression = vec![
-        FiguredBassSymbol {
-            bass: Pitch::new(48), // C3
-            chord_tones: vec![
-                Pitch::new(48), // C
-                Pitch::new(52), // E
-                Pitch::new(55), // G
-            ],
-        },
-        FiguredBassSymbol {
-            bass: Pitch::new(53), // F3
-            chord_tones: vec![
-                Pitch::new(53), // F
-                Pitch::new(57), // A
-                Pitch::new(60), // C
-            ],
-        },
-        FiguredBassSymbol {
-            bass: Pitch::new(55), // G3
-            chord_tones: vec![
-                Pitch::new(55), // G
-                Pitch::new(59), // B
-                Pitch::new(62), // D
-            ],
-        },
-        FiguredBassSymbol {
-            bass: Pitch::new(48), // C3
-            chord_tones: vec![
-                Pitch::new(48), // C
-                Pitch::new(52), // E
-                Pitch::new(55), // G
-            ],
-        },
+        FiguredBassSymbol::new(Pitch::new(48), "", &key),      // C3, root position (I)
+        FiguredBassSymbol::new(Pitch::new(57), "6", &key),     // A3, first inversion (IV6)
+        FiguredBassSymbol::new(Pitch::new(55), "7", &key),     // G3, dominant 7th (V7)
+        FiguredBassSymbol::new(Pitch::new(48), "", &key),      // C3, root position (I)
     ];
     
-    println!("Realizing figured bass progression...\n");
+    println!("Figured Bass Progression:");
+    for (i, symbol) in progression.iter().enumerate() {
+        let figure_str = match i {
+            0 => "(root position)",
+            1 => "6",
+            2 => "7",
+            3 => "(root position)",
+            _ => "",
+        };
+        println!("  {}: {} {}", i + 1, symbol.bass.name(), figure_str);
+        print!("     Chord tones: ");
+        for tone in &symbol.chord_tones {
+            print!("{} ", tone.name());
+        }
+        println!();
+    }
+    
+    println!("\nRealizing figured bass...\n");
     
     let voicings = realize_figured_bass(&progression);
     
+    println!("Voicings:");
     for (i, voicing) in voicings.iter().enumerate() {
-        println!("Chord {}: {}", i + 1, voicing);
+        println!("  Chord {}: {}", i + 1, voicing);
     }
     
     println!("\n--- Analysis ---");
